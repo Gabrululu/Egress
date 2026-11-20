@@ -25,7 +25,7 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: ${DB_PASSWORD:-egress-demo}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -41,8 +41,8 @@ services:
       -master.volumeSizeLimitMB=64 -master.volumePreallocate=false -volume.max=50
       -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
     ports:
-      - "9000:8333"   # S3 API
-      - "9001:8888"   # filer web UI (browse buckets)
+      - "127.0.0.1:9000:8333"   # S3 API
+      - "127.0.0.1:9001:8888"   # filer web UI (browse buckets)
     volumes:
       - s3data:/data
       - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
@@ -58,8 +58,8 @@ services:
       RABBITMQ_DEFAULT_USER: egress
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-egress-demo}
     ports:
-      - "5672:5672"
-      - "15672:15672"  # management UI
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"  # management UI
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -70,7 +70,7 @@ services:
     build: ./app
     environment: *app-env
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]
       interval: 3s

@@ -182,7 +182,9 @@ generation time and right before deploy:
 - images outside an allowlist (postgres, seaweedfs, rabbitmq, garage, minio, redis, ...)
 - `privileged`, `cap_add`, `devices`, `pid`/`ipc`/`network_mode: host`, `security_opt`, `sysctls`
 - any reference to `docker.sock`, bind mounts or build contexts outside `output/`
-- host ports outside the demo set (5000, 5432, 9000, 9001, 5672, 15672)
+- host ports outside the demo set (5000, 5432, 9000, 9001, 5672, 15672), or published on all
+  interfaces: every port must bind `127.0.0.1` (Docker bypasses host firewalls such as ufw, so
+  `"5432:5432"` on a VM would expose Postgres to the internet). LLM short-syntax ports are rebound automatically
 
 Deploys run in the background (`output/.deploy.log`, live in the UI); busy host ports are
 reported before starting.
@@ -258,11 +260,34 @@ scanner/      rules.py (regex rules + service profiles), engine.py (walk + score
 copilot/      config.py (env/.env), llm.py (client + prompt), generator.py (LLM → validate → fallback),
               fallback.py + templates/ (offline mapping, compose, migrated app), codegen.py (LLM files →
               exact diffs + checks), deploy.py + runner.py (background deploy, /health check, runtime fallback)
-app.py        Streamlit UI
+app.py        Streamlit UI (design tokens in ui_theme.py)
 sample_app/   Demo app on AWS: Flask + boto3 (S3, RDS, SQS), Lambda handler, main.tf, compose
 output/       Generated migration (gitignored except .gitkeep)
 tests/        pytest: scanner rules/scoring, copilot paths, UI helpers + Streamlit AppTest
 ```
+
+## Share the demo from a Codespace
+
+```bash
+make run-public   # UI in public demo mode (EGRESS_PUBLIC=1)
+make public       # make port 8501 public and print the visitor + presenter URLs
+make private      # close it again
+```
+
+Only port 8501 is published; the stack ports (API, RabbitMQ, SeaweedFS, Postgres) stay private.
+GitHub shows visitors a one-time "development port" warning with a **Continue** button.
+
+| | Visitor | Presenter (`?key=...`, removed from the address bar after login) |
+|---|---|---|
+| Scan | Bundled `sample_app` only (no host paths, no clones) | Any path or git URL |
+| Generate | Offline templates or answers already in the LLM cache: never spends credits | Real LLM calls |
+| Output | Private per-session folder (never touches `output/`) | `output/` |
+| Deploy / Stop / Wipe | Hidden (container status + smoke test only) | Full control |
+
+The presenter key comes from `EGRESS_ADMIN_KEY` or is generated into `.cache/egress-admin-key`
+(gitignored, chmod 600). Run **Generate** once as presenter before sharing so visitors get the
+LLM answer from the cache. Codespaces stop after the idle timeout (30 min by default): raise it
+in GitHub → Settings → Codespaces before a long session.
 
 ## Security notes
 

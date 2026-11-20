@@ -88,6 +88,23 @@ def _published_ports(ports) -> list[int]:
     return out
 
 
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def _host_ips(ports) -> list[tuple[int, str]]:
+    """(published port, host ip or '') for every published port."""
+    out = []
+    for p in ports or []:
+        if isinstance(p, dict):
+            pub, ip = p.get("published"), str(p.get("host_ip") or "")
+        else:
+            bits = str(p).split("/", 1)[0].split(":")
+            pub, ip = (bits[-2], ":".join(bits[:-2])) if len(bits) >= 2 else (None, "")
+        if pub not in (None, ""):
+            out.append((str(pub), ip.strip("[]")))
+    return out
+
+
 def check_policy(doc: dict, project_dir: Path) -> list[str]:
     """Return a list of violations (empty = allowed). `doc` may be raw YAML or normalized config."""
     project_dir = Path(project_dir)
@@ -137,6 +154,12 @@ def check_policy(doc: dict, project_dir: Path) -> list[str]:
         for port in _published_ports(svc.get("ports")):
             if port not in ALLOWED_HOST_PORTS:
                 errors.append(f"{name}: host port {port} not in {sorted(ALLOWED_HOST_PORTS)}")
+        # Docker publishes on 0.0.0.0 by default and bypasses host firewalls (ufw): on a VM with a
+        # public IP that exposes Postgres/RabbitMQ/S3 to the internet. Loopback only.
+        for port, ip in _host_ips(svc.get("ports")):
+            if ip not in LOOPBACK:
+                errors.append(f"{name}: port {port} is published on all interfaces; "
+                              f"use \"127.0.0.1:{port}:<container port>\"")
 
     for vname, vdef in (doc.get("volumes") or {}).items():
         if isinstance(vdef, dict) and (vdef.get("driver_opts") or vdef.get("external")):

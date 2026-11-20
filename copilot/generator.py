@@ -228,12 +228,20 @@ def pin_images(text: str) -> str:
     return re.sub(r"^(\s*image:\s*[\"']?)([^\s\"'@]+)([\"']?\s*)$", sub, text, flags=re.M)
 
 
+_SHORT_PORT = re.compile(r"^(\s*-\s*[\"']?)(\d+(?:-\d+)?:\d+(?:-\d+)?(?:/(?:tcp|udp))?[\"']?\s*(?:#.*)?)$", re.M)
+
+
+def bind_localhost(text: str) -> str:
+    """Publish short-syntax ports ("5432:5432") on 127.0.0.1 only (policy requires loopback)."""
+    return _SHORT_PORT.sub(lambda m: f"{m.group(1)}127.0.0.1:{m.group(2)}", text)
+
+
 def compose_problem(text, out: Path) -> tuple[str | None, dict | None]:
     """Write a candidate compose and run all gates. Returns (problem or None, validation)."""
     if not isinstance(text, str) or not text.strip():
         return "no docker_compose returned", None
     cand = out / "docker-compose.llm.yml"
-    cand.write_text(pin_images(text.strip()) + "\n", encoding="utf-8")
+    cand.write_text(bind_localhost(pin_images(text.strip())) + "\n", encoding="utf-8")
     v = validate_compose(cand)
     if not v["ok"]:
         return f"validation ({v['method']}): {v['message']}", v
@@ -268,7 +276,8 @@ def _part_problems(data: dict, target: Path, out: Path) -> dict:
 
 
 def _call_llm(scan_report: dict, target: Path, out: Path, cfg: LLMConfig, use_cache: bool,
-              cache_dir: Path, errors: list[str], meta: dict, include_files: list[str] | None = None) -> dict:
+              cache_dir: Path, errors: list[str], meta: dict, include_files: list[str] | None = None,
+              cache_only: bool = False) -> dict:
     """LLM call with response cache and one repair round for the gated parts (compose, code)."""
     user_prompt = build_user_prompt(scan_report, target, include_files)
     cache_file = _cache_file(cache_dir, cfg, user_prompt)
@@ -279,6 +288,10 @@ def _call_llm(scan_report: dict, target: Path, out: Path, cfg: LLMConfig, use_ca
         except (OSError, json.JSONDecodeError):
             meta["cache"] = "corrupt"
     meta["cache"] = meta.get("cache") or ("miss" if use_cache else "off")
+    if cache_only:
+        errors.append("No cached LLM answer for this input: public demo visitors get offline templates "
+                      "(new LLM calls need the presenter key)")
+        return {}
 
     try:
         data = chat_json(SYSTEM_PROMPT, user_prompt, cfg)
@@ -324,7 +337,8 @@ def _call_llm(scan_report: dict, target: Path, out: Path, cfg: LLMConfig, use_ca
 # --------------------------------------------------------------- main entry
 def generate(target: str | Path, scan_report: dict | None = None, out_dir: str | Path = DEFAULT_OUT,
              use_llm: bool = True, cfg: LLMConfig | None = None, use_cache: bool = True,
-             cache_dir: str | Path | None = None, include_files: list[str] | None = None) -> dict:
+             cache_dir: str | Path | None = None, include_files: list[str] | None = None,
+             llm_cache_only: bool = False) -> dict:
     target = Path(target).resolve()
     out = Path(out_dir).resolve()
     if scan_report is None:
@@ -344,7 +358,8 @@ def generate(target: str | Path, scan_report: dict | None = None, out_dir: str |
     llm_data: dict = {}
     if use_llm and cfg.enabled:
         llm_data = _call_llm(scan_report, target, out, cfg, use_cache,
-                             Path(cache_dir) if cache_dir else CACHE_DIR, errors, meta, include_files)
+                             Path(cache_dir) if cache_dir else CACHE_DIR, errors, meta, include_files,
+                             cache_only=llm_cache_only)
     elif use_llm:
         errors.append("LLM disabled: LLM_API_KEY not set (using offline templates)")
     else:

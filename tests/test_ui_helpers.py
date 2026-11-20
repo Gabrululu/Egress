@@ -120,3 +120,25 @@ def test_background_job_lifecycle(tmp_path, monkeypatch):
     assert "done" in job.tail()
     deploy.clear_job(tmp_path)
     assert deploy.current_job(tmp_path) is None
+
+
+def _contrast(a: str, b: str) -> float:
+    def lum(h):
+        c = [int(h.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_text_colours_meet_wcag_aa():
+    import re
+
+    import ui_theme as ui
+    gray = re.search(r"--eg-gray:(#[0-9a-f]{6})", ui.CSS).group(1)
+    for colour in [*ui.SEV_TEXT.values(), ui.BLUE_TEXT, gray]:
+        for bg in ("#ffffff", "#f5f5f5"):
+            assert _contrast(colour, bg) >= 4.5, (colour, bg)
+    assert _contrast("#ffffff", ui.BLUE_TEXT) >= 4.5  # primary button hover
+    for score in (90, 55, 10):
+        assert ui.score_text_color(score) in ui.score_card(score, "x", 1, 1)

@@ -1,6 +1,7 @@
 """Egress - Streamlit UI: scan -> generate migration -> deploy locally."""
 from __future__ import annotations
 
+import secrets
 import time
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 import ui_theme as ui
-from copilot import deploy, runner
+from copilot import access, deploy, runner
 from copilot.config import load_config
 from copilot.diagram import architecture_dot
 from copilot.generator import DEFAULT_OUT, generate
@@ -50,6 +51,18 @@ cfg = load_config()
 PROVIDER = ui.provider_name(cfg.base_url)
 ss.setdefault("offline", not cfg.enabled)
 
+# Public demo mode (EGRESS_PUBLIC=1): visitors are sandboxed; the presenter unlocks with ?key=...
+PUBLIC = access.public_mode()
+_qkey = st.query_params.get("key")
+if _qkey:
+    if access.is_presenter(_qkey):
+        ss.presenter = True
+    del st.query_params["key"]  # never leave the key visible in the address bar
+ss.setdefault("presenter", not PUBLIC)
+PRESENTER = ss.presenter
+ss.setdefault("sid", secrets.token_hex(8))
+WORK = OUT if PRESENTER else access.visitor_out_dir(ss.sid)  # visitors never touch output/
+
 
 def llm_panel():
     """Compact LLM status + offline toggle + settings popover, shown next to Generate."""
@@ -72,18 +85,28 @@ def llm_panel():
 
 # ------------------------------------------------------------------ hero + source
 md(ui.hero(f"{PROVIDER} · {cfg.model}" if cfg.enabled else "Offline mode"))
+if PUBLIC and not PRESENTER:
+    st.info("👋 **Public demo.** Scan the bundled AWS sample app, generate its migration and download it. "
+            "LLM answers come from the presenter's cache (or offline templates); deploy controls are "
+            "reserved for the presenter. Run your own copy with `git clone` + `make install run`.")
+elif PUBLIC:
+    st.success("🎤 Presenter mode: full access on this browser session.")
 
 md(ui.section("01 · Scan", "Find the lock-in.",
               "Point Egress at a local folder or a git URL. Rules cover Terraform, compose, Python and requirements."))
 with st.container(key="eg_source"):
     col_in, col_btn = st.columns([4, 1], vertical_alignment="bottom")
     with col_in:
-        src = st.text_input("Repository: local path or git URL", value=str(ROOT / "sample_app"))
+        src = st.text_input("Repository: local path or git URL", value=str(ROOT / "sample_app"),
+                            disabled=not PRESENTER,
+                            help=None if PRESENTER else "Public demo: only the bundled sample app can be scanned.")
     with col_btn:
         do_scan = st.button("Scan  →", type="primary", width="stretch")
 
 # ------------------------------------------------------------------ 1. scan
-if do_scan:
+if do_scan and not PRESENTER and not access.visitor_source_allowed(src):
+    fail("Public demo: only the bundled sample app can be scanned")
+elif do_scan:
     with st.spinner("Resolving source and scanning..."):
         try:
             cleanup(ss.clone_dir)
@@ -165,15 +188,16 @@ if report:
                 st.code(pv["user"], language="markdown")
         except Exception as e:
             fail("Could not build the prompt preview", e)
-    _job = deploy.current_job(OUT)
+    _job = deploy.current_job(WORK)
     if st.button("Generate migration", type="primary", disabled=bool(_job and _job.running),
                  help="Disabled while a deploy is running." if _job and _job.running else None):
         spin = "Generating from templates..." if ss.offline else f"Asking {PROVIDER} (template fallback ready)..."
         with st.spinner(spin):
             try:
-                ss.migration = generate(ss.scan_path, scan_report=report, out_dir=OUT,
+                ss.migration = generate(ss.scan_path, scan_report=report, out_dir=WORK,
                                         use_llm=not ss.offline, cfg=cfg,
-                                        include_files=ss.get(inc_key, files))
+                                        include_files=ss.get(inc_key, files),
+                                        llm_cache_only=not PRESENTER)
             except Exception as e:
                 ss.migration = None
                 fail("Migration generation failed", e)
@@ -252,7 +276,7 @@ if report:
 
         report_md = build_report_md(report, m)
         d1, d2, _ = st.columns([1, 1, 2])
-        d1.download_button("⬇ Migration (.zip)", data=build_zip(OUT, report_md), file_name="egress-migration.zip",
+        d1.download_button("⬇ Migration (.zip)", data=build_zip(WORK, report_md), file_name="egress-migration.zip",
                            mime="application/zip", width="stretch", on_click="ignore",
                            help="compose, app, diffs, plan and REPORT.md. Secrets (.env) are never included.")
         d2.download_button("⬇ Report (.md)", data=report_md, file_name="egress-report.md",
@@ -280,6 +304,21 @@ def show_job(job):
             st.code(job.tail(), language=None)
 
 
+def smoke_test():
+    import requests  # ships with streamlit
+    try:
+        r = requests.post("http://localhost:5000/upload",
+                          files={"file": ("egress-demo.txt", b"hello from egress\n")}, timeout=10)
+        r.raise_for_status()
+        st.success(f"Uploaded → `{r.json()}`")
+        time.sleep(1.5)
+        st.write("Latest uploads (status set by the worker):")
+        st.dataframe(pd.DataFrame(requests.get("http://localhost:5000/uploads", timeout=10).json()),
+                     hide_index=True, width="stretch")
+    except Exception as e:
+        fail("Smoke test failed (is the stack deployed?)", e)
+
+
 def show_status():
     try:
         rows = deploy.status(OUT)
@@ -291,7 +330,14 @@ def show_status():
         fail("Could not read container status", e)
 
 
-if (OUT / "docker-compose.yml").is_file():
+if (OUT / "docker-compose.yml").is_file() and not PRESENTER:
+    md(ui.section("03 · Run", "Same app. Zero AWS.", "The presenter's migrated stack, live in this Codespace."))
+    with st.container(key="eg_deploy"):
+        st.caption("Deploy / Stop are presenter-only. You can watch the containers and run the smoke test.")
+        show_status()
+        if st.button("Smoke test upload", width="stretch"):
+            smoke_test()
+elif (OUT / "docker-compose.yml").is_file():
     md(ui.section("03 · Run", "Same app. Zero AWS.",
                   f"docker compose up in {OUT}. First run builds images (about 1-2 min)."))
     job = deploy.current_job(OUT)
@@ -330,18 +376,7 @@ if (OUT / "docker-compose.yml").is_file():
         live_panel()
 
         if smoke:
-            import requests  # ships with streamlit
-            try:
-                r = requests.post("http://localhost:5000/upload",
-                                  files={"file": ("egress-demo.txt", b"hello from egress\n")}, timeout=10)
-                r.raise_for_status()
-                st.success(f"Uploaded → `{r.json()}`")
-                time.sleep(1.5)
-                st.write("Latest uploads (status set by the worker):")
-                st.dataframe(pd.DataFrame(requests.get("http://localhost:5000/uploads", timeout=10).json()),
-                             hide_index=True, width="stretch")
-            except Exception as e:
-                fail("Smoke test failed (is the stack deployed?)", e)
+            smoke_test()
 
         md(ui.links(LINKS))
 

@@ -4,7 +4,7 @@ BIN    := $(VENV)/bin
 SCAN_PATH ?= sample_app
 IMAGE  ?= egress:local
 
-.PHONY: install run scan test clean docker-build docker-run demo-check demo-warm demo-reset
+.PHONY: install run run-public public private scan test clean docker-build docker-run demo-check demo-warm demo-reset
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -14,6 +14,21 @@ install:
 
 run:
 	$(BIN)/streamlit run app.py --server.port 8501 --server.headless true
+
+# ---- share from a Codespace -------------------------------------------------------------------
+# Public demo mode: visitors are sandboxed (sample app only, cached LLM answers, no Deploy/Stop).
+run-public:
+	EGRESS_PUBLIC=1 $(BIN)/streamlit run app.py --server.port 8501 --server.headless true
+
+# Make the UI port public (only 8501; the stack ports stay private) and print both URLs.
+public:
+	@test -n "$$CODESPACE_NAME" || { echo "Not in a Codespace"; exit 1; }
+	gh codespace ports visibility 8501:public -c "$$CODESPACE_NAME"
+	@$(BIN)/python -m copilot.access
+
+private:
+	@test -n "$$CODESPACE_NAME" || { echo "Not in a Codespace"; exit 1; }
+	gh codespace ports visibility 8501:private -c "$$CODESPACE_NAME"
 
 scan:
 	$(BIN)/python -m scanner $(SCAN_PATH)

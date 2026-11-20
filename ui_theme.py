@@ -8,7 +8,10 @@ from __future__ import annotations
 import html
 
 BLUE = "#0099ff"
-SEV_COLOR = {"high": "#e5484d", "medium": "#ffa600", "low": "#30a46c"}
+SEV_COLOR = {"high": "#e5484d", "medium": "#ffa600", "low": "#30a46c"}  # dots, bars, tints
+# WCAG AA (>= 4.5:1 on white and #f5f5f5) variants for anything rendered as text.
+SEV_TEXT = {"high": "#c13b40", "medium": "#9a5b00", "low": "#18794e"}
+BLUE_TEXT = "#0070c9"  # blue as text / behind white text on light UI (0099ff is only 3:1)
 SERVICE_DOT = {
     "S3": "#d97757", "RDS": "#5684d1", "DynamoDB": "#9168c0", "SQS": "#1ba1e3",
     "SNS": "#ffa600", "Lambda": "#e5484d", "CloudWatch": "#30a46c", "IAM": "#757575",
@@ -19,8 +22,8 @@ CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
 :root{
-  --eg-black:#000; --eg-ink:#141414; --eg-gray:#757575; --eg-line:#e9e9e9;
-  --eg-bg:#f5f5f5; --eg-card:#fff; --eg-blue:#0099ff;
+  --eg-black:#000; --eg-ink:#141414; --eg-gray:#6b6b6b; --eg-line:#e9e9e9;
+  --eg-bg:#f5f5f5; --eg-card:#fff; --eg-blue:#0099ff; --eg-blue-text:#0070c9;
   --eg-font: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 .stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp button, .stApp textarea,
@@ -85,7 +88,7 @@ CSS = """
 .stButton > button[kind="primary"], .stButton > button[data-testid="stBaseButton-primary"] {
   background: var(--eg-black); color: #fff; border: 1px solid var(--eg-black); }
 .stButton > button[kind="primary"]:hover, .stButton > button[data-testid="stBaseButton-primary"]:hover {
-  background: var(--eg-blue); border-color: var(--eg-blue); color: #fff; }
+  background: var(--eg-blue-text); border-color: var(--eg-blue-text); color: #fff; }
 [data-testid="stTextInput"] div[data-baseweb="input"], [data-testid="stTextInput"] div[data-baseweb="base-input"] {
   border-radius: 60px; background: var(--eg-bg); }
 [data-testid="stTextInput"] div[data-baseweb="input"] { border: 1px solid var(--eg-line); padding-left: 8px; }
@@ -126,13 +129,13 @@ CSS = """
 .eg-ba-num { font-size: 64px; font-weight: 900; letter-spacing: -0.06em; line-height: 1; margin-top: 6px; }
 .eg-ba-num small { font-size: 18px; color: var(--eg-gray); font-weight: 600; letter-spacing: 0; margin-left: 4px; }
 .eg-ba-arrow { font-size: 32px; color: #c4c4c4; }
-.eg-ba-delta { background: #30a46c1a; color: #30a46c; border-radius: 60px; padding: 10px 18px;
+.eg-ba-delta { background: #30a46c1a; color: #18794e; border-radius: 60px; padding: 10px 18px;
   font-weight: 800; font-size: 18px; white-space: nowrap; }
 .eg-ba-note { color: var(--eg-gray); font-size: 13px; margin-top: 6px; }
 .eg-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .eg-links a { text-decoration: none; color: var(--eg-black); background: #fff; border: 1px solid var(--eg-line);
   border-radius: 60px; padding: 7px 14px; font-size: 13px; font-weight: 600; }
-.eg-links a:hover { border-color: var(--eg-blue); color: var(--eg-blue); }
+.eg-links a:hover { border-color: var(--eg-blue); color: var(--eg-blue-text); }
 .eg-footer { margin-top: 72px; padding-top: 24px; border-top: 1px solid var(--eg-line); color: var(--eg-gray);
   font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 </style>
@@ -198,24 +201,34 @@ def section(kicker: str, title: str, sub: str = "") -> str:
             f'<div class="eg-title">{esc(title)}</div>{sub_html}</div>')
 
 
+def _level(score: int) -> str:
+    return "high" if score >= 70 else "medium" if score >= 40 else "low"
+
+
 def score_color(score: int) -> str:
-    return SEV_COLOR["high"] if score >= 70 else SEV_COLOR["medium"] if score >= 40 else SEV_COLOR["low"]
+    """Bright colour for bars, dots and tinted backgrounds."""
+    return SEV_COLOR[_level(score)]
+
+
+def score_text_color(score: int) -> str:
+    """AA-contrast colour for the score as text."""
+    return SEV_TEXT[_level(score)]
 
 
 def score_card(score: int, rating: str, findings: int, files: int) -> str:
-    c = score_color(score)
+    c, t = score_color(score), score_text_color(score)
     pct = max(0, min(100, int(score)))
     return f"""
 <div class="eg-score-label">Overall lock-in score</div>
 <div style="display:flex;align-items:flex-end;gap:10px;margin:8px 0 14px">
-  <div class="eg-score-num" style="color:{c}">{pct}</div>
-  <div style="color:#757575;font-weight:600;padding-bottom:12px">/100</div>
+  <div class="eg-score-num" style="color:{t}">{pct}</div>
+  <div style="color:var(--eg-gray);font-weight:600;padding-bottom:12px">/100</div>
 </div>
 <div style="height:10px;background:#f0f0f0;border-radius:60px;overflow:hidden">
   <div style="width:{pct}%;height:100%;background:{c};border-radius:60px"></div>
 </div>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px">
-  <span class="eg-badge" style="background:{c}1a;color:{c}">{esc(rating)} lock-in</span>
+  <span class="eg-badge" style="background:{c}1a;color:{t}">{esc(rating)} lock-in</span>
   <span class="eg-score-label">{findings} findings · {files} files</span>
 </div>"""
 
@@ -246,11 +259,11 @@ def before_after(before: int, before_rating: str, after: dict) -> str:
     return f"""
 <div class="eg-ba">
   <div><div class="eg-ba-label">Before · AWS</div>
-    <div class="eg-ba-num" style="color:{score_color(before)}">{before}<small>/100</small></div>
+    <div class="eg-ba-num" style="color:{score_text_color(before)}">{before}<small>/100</small></div>
     <div class="eg-ba-note">{esc(before_rating)} lock-in</div></div>
   <div class="eg-ba-arrow">→</div>
   <div><div class="eg-ba-label">After · migrated stack</div>
-    <div class="eg-ba-num" style="color:{score_color(a)}">{a}<small>/100</small></div>
+    <div class="eg-ba-num" style="color:{score_text_color(a)}">{a}<small>/100</small></div>
     <div class="eg-ba-note">{esc(note)}</div></div>
   <div class="eg-ba-delta">−{delta} pts · {pct}% less lock-in</div>
 </div>"""
