@@ -1,0 +1,22 @@
+# Runs the API container, but every backing service is AWS-managed:
+# storage = S3, database = RDS, queue = SQS, logs = CloudWatch.
+services:
+  api:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      AWS_REGION: eu-west-1
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      S3_BUCKET: egress-demo-uploads
+      SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/123456789012/egress-demo-jobs
+      RDS_ENDPOINT: egress-demo-db.abcdefgh1234.eu-west-1.rds.amazonaws.com
+      DB_NAME: uploads
+      DB_USER: app
+      DB_PASSWORD: ${DB_PASSWORD}
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: eu-west-1
+        awslogs-group: /egress-demo/api
