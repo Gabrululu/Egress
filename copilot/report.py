@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Never shipped in the zip: secrets, logs, rejected LLM candidates.
-ZIP_EXCLUDE = {".env", ".deploy.log", "docker-compose.llm.yml"}
+ZIP_EXCLUDE = {".env", ".deploy.log", ".deploy-result.json", "docker-compose.llm.yml"}
 
 
 def _md_cell(v) -> str:
@@ -68,7 +68,8 @@ def build_zip(out_dir: Path, report_md: str | None = None) -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(out_dir.rglob("*")):
             rel = p.relative_to(out_dir)
-            if not p.is_file() or rel.name in ZIP_EXCLUDE or rel.name == ".gitkeep":
+            if not p.is_file() or rel.name in ZIP_EXCLUDE or rel.name == ".gitkeep" \
+                    or rel.parts[0] == "app.llm-failed":
                 continue
             if rel.as_posix() == "seaweedfs/s3.json":  # holds the generated S3 secret
                 z.writestr(f"egress-migration/{rel.as_posix()}", _scrub_s3_config(p))

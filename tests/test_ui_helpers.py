@@ -106,7 +106,7 @@ def test_background_job_lifecycle(tmp_path, monkeypatch):
     script = "import time; print('building...', flush=True); time.sleep(1); print('done')"
 
     def fake_spawn(args, cwd, log_path):
-        assert args[:2] == ["docker", "compose"] and "--wait" in args
+        assert args[1:3] == ["-m", "copilot.runner"] and "--wait-timeout" in args
         log = open(log_path, "w")
         return subprocess.Popen([sys.executable, "-c", script], stdout=log, stderr=subprocess.STDOUT)
     monkeypatch.setattr(deploy, "_spawn", fake_spawn)

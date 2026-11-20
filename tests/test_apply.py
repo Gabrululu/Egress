@@ -91,16 +91,18 @@ def test_no_git_keeps_template(tmp_path, monkeypatch):
     assert sp["app_source"] == "template" and "git" in sp["reason"]
 
 
-def test_llm_diffs_that_dont_apply_fall_back(tmp_path, monkeypatch):
+def test_llm_code_that_fails_verification_falls_back(tmp_path, monkeypatch):
     reply = {"mapping": [{"aws": "S3", "alternative": "SeaweedFS", "reason": "r"}],
              "docker_compose": fallback.compose_text(),
-             "diffs": [{"file": "app.py", "diff": "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x\n+y\n"}],
+             "files": [{"path": "app.py", "original": "app.py", "content": "def broken(:\n"}],
              "plan": "# Plan\n\n## Steps\n1. a\n\n## Risks\n- b\n\n## Effort estimate\n5 days total for all."}
     monkeypatch.setattr(gen, "chat_json", lambda *a, **k: reply)
     monkeypatch.setattr(gen, "CACHE_DIR", tmp_path / "cache")
     r = gen.generate(SAMPLE, out_dir=tmp_path / "o", cfg=LLMConfig(api_key="k", base_url="https://x/v1"))
-    assert r["sources"]["diffs"] == "llm" and r["source_patch"]["app_source"] == "template"
-    assert (tmp_path / "o" / "app" / "worker.py").exists()  # template still runnable
+    assert r["sources"]["diffs"] == "fallback" and r["sources"]["compose"] == "llm"
+    assert any("LLM code rejected" in e for e in r["errors"])
+    assert r["source_patch"]["app_source"] == "patched-repo"  # template diffs still apply
+    assert (tmp_path / "o" / "app" / "worker.py").exists()
 
 
 def test_works_when_output_is_inside_a_git_repo(tmp_path):

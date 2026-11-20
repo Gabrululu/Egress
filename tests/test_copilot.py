@@ -19,11 +19,21 @@ def isolated_cache(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(gen, "CACHE_DIR", tmp_path_factory.mktemp("llm-cache"))
 
 
+def llm_files():
+    """A correct LLM answer for the code part: the reference migrated files, complete."""
+    t = fallback.TEMPLATES / "app"
+    return [{"path": "app.py", "original": "app.py", "content": (t / "app.py").read_text()},
+            {"path": "worker.py", "original": "lambda_function.py", "content": (t / "worker.py").read_text()},
+            {"path": "requirements.txt", "original": "requirements.txt",
+             "content": (t / "requirements.txt").read_text()},
+            {"path": "Dockerfile", "original": "Dockerfile", "content": (t / "Dockerfile").read_text()}]
+
+
 def _llm_reply(compose=None):
     return {
         "mapping": [{"aws": "S3", "alternative": "SeaweedFS", "reason": "S3 API"}],
         "docker_compose": compose if compose is not None else fallback.compose_text(),
-        "diffs": [{"file": "app.py", "diff": "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x\n+y\n"}],
+        "files": llm_files(),
         "plan": "# Plan\n\n## Steps\n1. do things\n\n## Risks\n- some\n\n## Effort estimate\n5 days total.",
     }
 
@@ -44,6 +54,7 @@ def test_llm_success(tmp_path, monkeypatch):
     r = gen.generate(SAMPLE, out_dir=tmp_path, cfg=KEY)
     assert r["path"] == "llm", r["errors"]
     assert r["mapping"][0]["alternative"] == "SeaweedFS"
+    assert r["source_patch"]["app_source"] == "patched-repo", r["source_patch"]
 
 
 def test_llm_exception_falls_back(tmp_path, monkeypatch):

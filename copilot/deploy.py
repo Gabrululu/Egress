@@ -7,8 +7,11 @@ starting, the compose file must pass the security policy and its host ports must
 from __future__ import annotations
 
 import json
+import os
+import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -119,7 +122,10 @@ class DeployJob:
 
     def stop(self) -> None:
         if self.running:
-            self.proc.terminate()
+            try:  # the runner spawns docker compose: stop the whole process group
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                self.proc.terminate()
             try:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -147,8 +153,10 @@ def clear_job(out_dir: Path) -> None:
 def _spawn(args: list[str], cwd: Path, log_path: Path) -> subprocess.Popen:
     log = open(log_path, "w", encoding="utf-8")  # child keeps its own fd; closed when it exits
     try:
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
         return subprocess.Popen(args, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
     except FileNotFoundError:
         raise DeployError("docker is not installed or not on PATH.")
     finally:
@@ -156,15 +164,17 @@ def _spawn(args: list[str], cwd: Path, log_path: Path) -> subprocess.Popen:
 
 
 def start_up(out_dir: Path, wait_timeout: int = 360) -> DeployJob:
-    """Start `docker compose up -d --build --wait` in the background (non-blocking)."""
+    """Start the deploy runner in the background (non-blocking): `docker compose up --build --wait`,
+    a /health probe, and an automatic switch to the reference app if LLM-written code fails."""
     compose_file = _compose_file(out_dir)
     with _LOCK:
         job = current_job(out_dir)
         if job and job.running:
             raise DeployError("A deploy is already running.")
         preflight(out_dir)
-        args = ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build", "--force-recreate",
-                "--wait", "--wait-timeout", str(wait_timeout)]
+        from .runner import RESULT_NAME
+        (compose_file.parent / RESULT_NAME).unlink(missing_ok=True)
+        args = [sys.executable, "-m", "copilot.runner", str(compose_file.parent), "--wait-timeout", str(wait_timeout)]
         log_path = compose_file.parent / LOG_NAME
         job = DeployJob(_spawn(args, compose_file.parent, log_path), log_path, "up")
         _JOBS[_key(out_dir)] = job

@@ -26,7 +26,7 @@ def load_dotenv(path: Path = REPO_ROOT / ".env") -> None:
 class LLMConfig:
     base_url: str = "https://api.mistral.ai/v1"
     api_key: str = ""
-    model: str = "mistral-large-latest"
+    model: str = "mistral-medium-latest"
     timeout: float = 60.0
 
     @property

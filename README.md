@@ -50,7 +50,7 @@ flowchart LR
     SRC --> SC[scanner/<br/>rules + scoring]
     SC -->|scan JSON| CP[copilot/generator.py]
     CP -->|prompt: scan + snippets| LLM[(OpenAI-compatible LLM<br/>Mistral / Ollama / ...)]
-    LLM -->|JSON: mapping, compose,<br/>diffs, plan| CP
+    LLM -->|JSON: mapping, compose,<br/>full files, plan| CP
     CP -->|invalid / timeout / no key| FB[copilot/fallback.py<br/>+ templates/]
     CP --> VAL{docker compose config<br/>+ contract check}
     VAL -->|ok| OUT[output/]
@@ -116,7 +116,7 @@ Different interpreter: `make install PYTHON=python3.12`.
 |---|---|---|
 | `LLM_BASE_URL` | `https://api.mistral.ai/v1` | Any OpenAI-compatible endpoint |
 | `LLM_API_KEY` | `...` | Empty → offline templates (local URLs need no key) |
-| `LLM_MODEL` | `mistral-large-latest` | e.g. `llama3.1` for Ollama |
+| `LLM_MODEL` | `mistral-medium-latest` | ~30 s per migration; `mistral-large-latest` is a reasoning model and took >10 min. e.g. `llama3.1` for Ollama |
 | `LLM_TIMEOUT` | `60` | Seconds before falling back |
 
 Ollama: `LLM_BASE_URL=http://localhost:11434/v1`, `LLM_API_KEY=ollama`, `LLM_MODEL=llama3.1`.
@@ -137,7 +137,7 @@ cd output && docker compose up -d --build --wait        # run migrated stack
 | 0:00 | Open `localhost:8501`; show `sample_app/` (Flask + boto3 + `main.tf`) | "A typical upload service: S3, RDS, SQS, a Lambda, CloudWatch logs." |
 | 0:15 | Click **🔍 Scan** | "32 findings across 7 services, each with file, line and the *reason* it locks you in. Overall score 63/100." |
 | 0:35 | Point at service table + gauge, open *Scoring formula* | "Proprietary API weighs 50%, data format 30%, egress 20%. Lambda and S3 hurt most." |
-| 0:50 | Click **🧠 Generate migration** | "The LLM gets the scan and code snippets and returns mapping, compose, diffs and plan." |
+| 0:50 | Click **🧠 Generate migration** | "The LLM gets the scan and code snippets and returns mapping, compose, migrated files and plan; Egress turns the files into exact diffs." |
 | 1:05 | Show badge (LLM / Offline / Mixed), then tabs *Mapping → Code diffs → Plan* | "Every part is validated. If the LLM fails, built-in templates take over, so the demo never breaks. The diff is tiny: `endpoint_url`, pika instead of SQS, Lambda → worker." |
 | 1:25 | Click **🚀 Deploy** | "`docker compose up`: Postgres, S3-compatible storage, RabbitMQ, API and worker, all open-source." |
 | 1:45 | Click **🧪 Smoke test upload** | "Upload → object storage → Postgres → queue → worker marks it processed. Same app, zero AWS." |
@@ -162,8 +162,10 @@ Everything that depends on the network or the LLM has an offline path:
 | No `LLM_API_KEY` (and non-local URL) | LLM skipped → all parts from templates (`path: fallback`) |
 | Timeout / API / network error | Error recorded → templates (`fallback`) |
 | Reply is not valid JSON | Templates (`fallback`) |
-| A single part invalid (e.g. bad diffs) | Only that part from templates (`path: mixed`) |
-| LLM compose fails `docker compose config`, the contract or the security policy | **One repair round**: the error is sent back to the LLM; if the fix still fails, the template compose is used (candidate kept as `docker-compose.llm.yml`) |
+| A single part invalid (e.g. code that does not compile) | Only that part from templates (`path: mixed`) |
+| LLM compose fails `docker compose config`, the contract or the security policy, or LLM code fails its checks | **One repair round** for every failing part: the errors are sent back to the LLM; each part it fixes is adopted, the rest come from templates (candidate compose kept as `docker-compose.llm.yml`) |
+| Reply is not readable JSON | Retried once, then templates |
+| LLM-written app passes every static check but **fails at runtime** (crash, no `/health`) | Deploy saves its api/worker logs, moves it to `output/app.llm-failed/` and **redeploys the reference app automatically**; the UI shows why |
 | Same scan + model + prompt as a previous successful run | Answer served from the local cache `.cache/llm/` (instant, offline, free) |
 | Docker not installed | Compose validated as YAML only; deploy shows an error |
 | git clone fails / times out (90s) | Clear error in the UI, no stack trace |
@@ -201,6 +203,15 @@ run their tools in pinned containers (only Docker needed):
 The UI also draws **before/after architecture diagrams** from the scan (Graphviz, no extra deps).
 
 ### Runnable app built from your repo
+
+The LLM returns **complete migrated files**, never diffs (LLMs miscount hunk headers and mangle
+patches). Egress computes exact git-style diffs itself with `difflib`, and before accepting the
+code it builds the patched repo and checks that it compiles, reads the env vars the compose
+provides (`S3_ENDPOINT_URL`, `AMQP_URL`, `QUEUE_NAME`, `DB_HOST`), contains no elided `...`
+blocks or unsafe paths, and that a re-scan finds no AWS lock-in left. Files Egress manages
+itself (`seaweedfs/s3.json`, `.env`, keys) are never taken from the LLM. LLM images are pinned
+to the template digests, and the compose contract rejects `${VAR}`s that are never set,
+bind-mounted data and missing healthchecks (`api` must expose `/health`).
 
 After generating, Egress copies the scanned repo, applies every app-level diff with
 `git apply --check` + `git apply` (git-style patches, so `lambda_function.py → worker.py` is a
@@ -245,7 +256,8 @@ Example: S3 with one high finding → `0.5*70 + 0.3*40 + 0.2*90 = 65`.
 scanner/      rules.py (regex rules + service profiles), engine.py (walk + score),
               source.py (path / git clone), __main__.py (CLI)
 copilot/      config.py (env/.env), llm.py (client + prompt), generator.py (LLM → validate → fallback),
-              fallback.py + templates/ (offline mapping, compose, migrated app), deploy.py (docker compose)
+              fallback.py + templates/ (offline mapping, compose, migrated app), codegen.py (LLM files →
+              exact diffs + checks), deploy.py + runner.py (background deploy, /health check, runtime fallback)
 app.py        Streamlit UI
 sample_app/   Demo app on AWS: Flask + boto3 (S3, RDS, SQS), Lambda handler, main.tf, compose
 output/       Generated migration (gitignored except .gitkeep)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from . import fallback
 from .config import REPO_ROOT, LLMConfig, load_config
 from .llm import SYSTEM_PROMPT, LLMError, build_user_prompt, chat_json
 from .apply import build_app_from_source
+from .codegen import code_problem, files_to_diffs
 from .datamig import generate_data_migration
 from .policy import check_compose_file
 
@@ -22,18 +24,21 @@ from .policy import check_compose_file
 # (compose bind mounts are resolved by the host Docker daemon).
 DEFAULT_OUT = Path(os.environ.get("EGRESS_OUTPUT_DIR") or REPO_ROOT / "output")
 CACHE_DIR = Path(os.environ.get("EGRESS_CACHE_DIR") or REPO_ROOT / ".cache" / "llm")
-CACHE_VERSION = "v4"  # bump when prompt/contract semantics change
+CACHE_VERSION = "v6"  # bump when prompt/contract semantics change
 REPAIR_PROMPT = (
-    "Your docker_compose was rejected by automated checks:\n{problem}\n\n"
-    "Return the COMPLETE JSON object again (all four keys). Fix docker_compose so it passes "
-    "`docker compose config`, follows the contract in the instructions exactly, and uses no "
-    "privileged mode, host mounts outside the project, docker.sock or non-allowlisted images."
+    "Your answer was rejected by automated checks:\n{problem}\n\n"
+    "Return the COMPLETE JSON object again (all four keys), fixing what failed. docker_compose must "
+    "pass `docker compose config`, follow the contract in the instructions exactly, and use no "
+    "privileged mode, host mounts outside the project, docker.sock or non-allowlisted images. "
+    "files must be complete, compilable source files (never diffs) that remove the AWS lock-in listed."
 )
+ALLOWED_BIND_SOURCES = {"./seaweedfs/s3.json"}
 REQUIRED_SERVICES = {"postgres", "s3", "rabbitmq", "api", "worker"}
 REQUIRED_APP_ENV = {"S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "AMQP_URL",
                     "QUEUE_NAME", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"}
 GENERATED = ["app", ".app-src.tmp", "data-migration", "seaweedfs", "diffs", "docker-compose.yml", "docker-compose.llm.yml",
-             "mapping.json", "mapping.md", "migration.diff", "MIGRATION_PLAN.md", "result.json", ".deploy.log"]
+             "mapping.json", "mapping.md", "migration.diff", "MIGRATION_PLAN.md", "result.json", ".deploy.log",
+             "app.llm-failed", ".deploy-result.json"]
 
 
 # --------------------------------------------------------------- validation
@@ -57,9 +62,19 @@ def validate_compose(path: Path) -> dict:
     return {"ok": True, "method": "docker compose config", "message": "valid"}
 
 
+_INTERP = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[-?+][^}]*)?\}")
+
+
 def check_contract(path: Path) -> str | None:
     """Ensure an LLM compose matches what the generated app/ code expects. Returns error or None."""
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = path.read_text(encoding="utf-8")
+    # Only the generated .env exists at deploy time: any other ${VAR} silently becomes "".
+    unset = sorted({m.group(1) for m in _INTERP.finditer(raw)
+                    if m.group(1) not in SECRET_KEYS and not (m.group(2) or "").lstrip(":").startswith("-")})
+    if unset:
+        return (f"uses ${{...}} variables that are never set: {unset}; write literal values "
+                f"(only {', '.join(SECRET_KEYS)} come from .env)")
+    doc = yaml.safe_load(raw)
     svcs = doc.get("services", {})
     missing = REQUIRED_SERVICES - set(svcs)
     if missing:
@@ -71,6 +86,19 @@ def check_contract(path: Path) -> str | None:
         miss = REQUIRED_APP_ENV - set(env)
         if miss:
             return f"{name} missing env vars: {sorted(miss)}"
+    hc = (svcs["s3"].get("healthcheck") or {}).get("test")
+    if not hc or "8888" not in json.dumps(hc):
+        return ("s3 healthcheck must probe the filer, which needs no credentials: "
+                '["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8888/ || exit 1"]')
+    hc = (svcs["api"].get("healthcheck") or {}).get("test")
+    if not hc or "/health" not in json.dumps(hc):
+        return "api needs a healthcheck that calls http://127.0.0.1:5000/health (so deploy can verify it)"
+    for name in ("postgres", "s3", "rabbitmq"):
+        for vol in svcs[name].get("volumes") or []:
+            src = vol.get("source", "") if isinstance(vol, dict) else str(vol).split(":", 1)[0]
+            if src.startswith((".", "/", "~")) and src.rstrip("/") not in ALLOWED_BIND_SOURCES:
+                return (f"{name} bind-mounts {src}: keep data in named volumes "
+                        "(only ./seaweedfs/s3.json may be bind-mounted)")
     text = json.dumps(doc)  # parsed content only, comments ignored
     if "awslogs" in text or "amazonaws.com" in text:
         return "compose still references AWS"
@@ -86,13 +114,13 @@ def _valid_mapping(m) -> list[dict] | None:
     return rows or None
 
 
-def _valid_diffs(d) -> list[dict] | None:
-    if not isinstance(d, list):
-        return None
-    rows = [{"file": str(x.get("file", "patch")), "diff": x["diff"].rstrip() + "\n"}
-            for x in d if isinstance(x, dict) and isinstance(x.get("diff"), str)
-            and "@@" in x["diff"] and ("---" in x["diff"] or "+++" in x["diff"])]
-    return rows or None
+def code_files_problem(files, target: Path) -> tuple[list[dict] | None, str | None]:
+    """LLM `files` -> (exact diffs, None) if they build and verify, else (None, problem)."""
+    diffs, problems = files_to_diffs(files, target)
+    if problems:
+        return None, "; ".join(problems)[:1500]
+    problem = code_problem(diffs, target)
+    return (None, problem) if problem else (diffs, None)
 
 
 def _valid_plan(p) -> str | None:
@@ -184,12 +212,28 @@ def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in name.strip("/"))[:60] or "patch"
 
 
+def _pinned_refs() -> dict[str, str]:
+    """'repo:tag' -> 'repo:tag@sha256:...' for every image pinned in the shipped template."""
+    refs = re.findall(r"^\s*image:\s*[\"']?(\S+?@sha256:[0-9a-f]{64})", fallback.compose_text(), re.M)
+    return {r.split("@")[0]: r for r in refs}
+
+
+def pin_images(text: str) -> str:
+    """Pin LLM-chosen images to the template's digests when the tag matches (supply chain)."""
+    pinned = _pinned_refs()
+
+    def sub(m):
+        ref = m.group(2)
+        return f"{m.group(1)}{pinned.get(ref, ref)}{m.group(3)}"
+    return re.sub(r"^(\s*image:\s*[\"']?)([^\s\"'@]+)([\"']?\s*)$", sub, text, flags=re.M)
+
+
 def compose_problem(text, out: Path) -> tuple[str | None, dict | None]:
     """Write a candidate compose and run all gates. Returns (problem or None, validation)."""
     if not isinstance(text, str) or not text.strip():
         return "no docker_compose returned", None
     cand = out / "docker-compose.llm.yml"
-    cand.write_text(text.strip() + "\n", encoding="utf-8")
+    cand.write_text(pin_images(text.strip()) + "\n", encoding="utf-8")
     v = validate_compose(cand)
     if not v["ok"]:
         return f"validation ({v['method']}): {v['message']}", v
@@ -211,9 +255,21 @@ def _cache_file(cache_dir: Path, cfg: LLMConfig, user_prompt: str) -> Path:
     return cache_dir / f"{key}.json"
 
 
+def _part_problems(data: dict, target: Path, out: Path) -> dict:
+    """Problems per gated part of an LLM answer ({} = everything passes)."""
+    problems = {}
+    p, _ = compose_problem(data.get("docker_compose"), out)
+    if p:
+        problems["docker_compose"] = p
+    _, cp = code_files_problem(data.get("files"), target)
+    if cp:
+        problems["files"] = cp
+    return problems
+
+
 def _call_llm(scan_report: dict, target: Path, out: Path, cfg: LLMConfig, use_cache: bool,
               cache_dir: Path, errors: list[str], meta: dict, include_files: list[str] | None = None) -> dict:
-    """LLM call with response cache and one repair round for the compose part."""
+    """LLM call with response cache and one repair round for the gated parts (compose, code)."""
     user_prompt = build_user_prompt(scan_report, target, include_files)
     cache_file = _cache_file(cache_dir, cfg, user_prompt)
     if use_cache and cache_file.is_file():
@@ -231,25 +287,26 @@ def _call_llm(scan_report: dict, target: Path, out: Path, cfg: LLMConfig, use_ca
         errors.append(str(e))
         return {}
 
-    problem, _ = compose_problem(data.get("docker_compose"), out)
-    if problem:
+    problems = _part_problems(data, target, out)
+    if problems:
         meta["repair"] = "attempted"
+        listing = "\n".join(f"- {k}: {v}" for k, v in problems.items())
         history = [{"role": "assistant", "content": json.dumps(data)},
-                   {"role": "user", "content": REPAIR_PROMPT.format(problem=problem[:1500])}]
+                   {"role": "user", "content": REPAIR_PROMPT.format(problem=listing[:3000])}]
         try:
             fixed = chat_json(SYSTEM_PROMPT, user_prompt, cfg, history=history)
             meta["calls"] += 1
-            p2, _ = compose_problem(fixed.get("docker_compose"), out)
-            if p2 is None:
-                meta["repair"] = "fixed"
-                errors.append(f"LLM compose rejected ({problem[:200]}); repaired on 2nd attempt")
-                data["docker_compose"] = fixed["docker_compose"]
-                # adopt other repaired parts only where the first answer was unusable
-                for key, ok in (("mapping", _valid_mapping), ("diffs", _valid_diffs), ("plan", _valid_plan)):
-                    if ok(data.get(key)) is None and ok(fixed.get(key)) is not None:
-                        data[key] = fixed[key]
-            else:
-                meta["repair"] = "failed"
+            still = _part_problems(fixed, target, out)
+            repaired = [k for k in problems if k not in still]
+            for k in repaired:
+                data[k] = fixed[k]
+            # adopt other repaired parts only where the first answer was unusable
+            for key, ok in (("mapping", _valid_mapping), ("plan", _valid_plan)):
+                if ok(data.get(key)) is None and ok(fixed.get(key)) is not None:
+                    data[key] = fixed[key]
+            meta["repair"] = "fixed" if len(repaired) == len(problems) else "partial" if repaired else "failed"
+            for k in repaired:
+                errors.append(f"LLM {k} rejected ({problems[k][:200]}); repaired on 2nd attempt")
         except LLMError as e:
             meta["repair"] = "error"
             errors.append(f"repair call failed: {e}")
@@ -320,10 +377,12 @@ def generate(target: str | Path, scan_report: dict | None = None, out_dir: str |
             validation = {"ok": False, "method": "security policy", "message": "; ".join(violations)}
         sources["compose"] = "fallback"
 
-    # (c) diffs
-    diffs = _valid_diffs(llm_data.get("diffs")) if llm_data else None
-    if llm_data and diffs is None:
-        errors.append("LLM diffs invalid")
+    # (c) code: complete files from the LLM -> exact diffs, built + verified; else template diffs
+    diffs = None
+    if llm_data:
+        diffs, problem = code_files_problem(llm_data.get("files"), target)
+        if problem:
+            errors.append(f"LLM code rejected: {problem}")
     sources["diffs"] = "llm" if diffs else "fallback"
     diffs = diffs or fallback.diffs(target)
 

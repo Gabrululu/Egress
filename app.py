@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 import ui_theme as ui
-from copilot import deploy
+from copilot import deploy, runner
 from copilot.config import load_config
 from copilot.diagram import architecture_dot
 from copilot.generator import DEFAULT_OUT, generate
@@ -266,11 +266,18 @@ def show_job(job):
     if job.running:
         st.info(f"⏳ Deploying in the background… {secs}. You can keep using the page.")
         st.code(job.tail() or "starting docker compose…", language=None)
-    elif job.returncode == 0:
-        st.success(f"Stack is up and healthy ({secs}).")
     else:
-        st.error(f"Deploy failed (exit code {job.returncode}, {secs}). Last log lines:")
-        st.code(job.tail(), language=None)
+        outcome = runner.read_outcome(OUT) or {}
+        if outcome.get("fallback"):
+            st.warning(f"The LLM-written app failed at runtime ({outcome.get('reason')}), so Egress redeployed "
+                       "the reference app automatically. The LLM version is kept in `output/app.llm-failed/`.")
+            with st.expander("Why the LLM app failed (api/worker logs)"):
+                st.code(outcome.get("llm_logs") or "(no logs)", language=None)
+        if job.returncode == 0:
+            st.success(f"Stack is up and healthy: /health verified ({secs}).")
+        else:
+            st.error(f"Deploy failed (exit code {job.returncode}, {secs}). Last log lines:")
+            st.code(job.tail(), language=None)
 
 
 def show_status():
