@@ -34,15 +34,18 @@ def admin_key(create: bool = True) -> str:
     env = os.environ.get("EGRESS_ADMIN_KEY", "").strip()
     if env:
         return env
-    if KEY_FILE.is_file():
-        return KEY_FILE.read_text(encoding="utf-8").strip()
-    if not create:
+    try:
+        if KEY_FILE.is_file():
+            return KEY_FILE.read_text(encoding="utf-8").strip()
+        if not create:
+            return ""
+        KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        key = secrets.token_urlsafe(16)
+        KEY_FILE.write_text(key + "\n", encoding="utf-8")
+        KEY_FILE.chmod(0o600)
+        return key
+    except OSError:  # read-only image (docker-run without EGRESS_ADMIN_KEY): no presenter key
         return ""
-    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    key = secrets.token_urlsafe(16)
-    KEY_FILE.write_text(key + "\n", encoding="utf-8")
-    KEY_FILE.chmod(0o600)
-    return key
 
 
 def is_presenter(supplied: str | None) -> bool:

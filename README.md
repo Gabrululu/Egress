@@ -94,6 +94,44 @@ Files are written with your uid/gid.
 Dependencies and container images are pinned (exact versions in `requirements.txt`,
 `@sha256` digests in the Dockerfiles and the generated compose).
 
+### Running on a fresh Linux VM (e.g. the hackathon VM)
+
+Target: Ubuntu 24.04 with Docker (developed and tested in a GitHub Codespace on Ubuntu 24.04).
+About 10 minutes, mostly image downloads; needs ~6 GB of free disk.
+
+```bash
+# 1. Docker + Compose v2 (skip if `docker compose version` already works)
+sudo apt-get update && sudo apt-get install -y git make curl
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER" && newgrp docker      # use Docker without sudo
+
+# 2. Get Egress and (optionally) an LLM key
+git clone https://github.com/Gabrululu/Egress.git && cd Egress
+cp .env.example .env      # edit: LLM_API_KEY=...  (leave empty for offline templates)
+
+# 3a. Run Egress in Docker (recommended: no Python setup on the VM)
+make docker-build && make docker-run
+
+# 3b. ...or natively. Ubuntu 24.04 ships Python 3.12 (Egress is developed on 3.11):
+#     sudo apt-get install -y python3-venv && make install PYTHON=python3 && make run
+
+# 4. Before the demo (second terminal, native install): pre-pull images and check readiness
+make demo-warm && make demo-check
+```
+
+**Reaching the UI.** The migrated stack only listens on `127.0.0.1`, so only port **8501** matters:
+
+- Presenter only (safest): `ssh -L 8501:localhost:8501 user@VM`, then open http://localhost:8501.
+- Shared with the audience: open 8501 in the VM firewall / security group and add
+  `EGRESS_PUBLIC=1` to `.env` (works for `make run`, `make run-public` and `make docker-run`).
+  Visitors get the sandboxed demo; open `http://VM:8501/?key=<key>` yourself. With
+  `make docker-run`, **set `EGRESS_ADMIN_KEY=<long random string>` in `.env`** (the container is
+  ephemeral); natively the key is also auto-generated into `.cache/egress-admin-key`. See
+  [Share the demo](#share-the-demo-from-a-codespace) for what visitors can and cannot do.
+
+The VM is decommissioned after the event: nothing needs to persist, but don't leave real API keys
+on it (`rm .env` when you're done).
+
 ### CI and GitHub Code Scanning
 
 - `.github/workflows/ci.yml`: unit tests, offline migration + compose/policy validation, a real

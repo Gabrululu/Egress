@@ -105,3 +105,15 @@ def test_presenter_key_unlocks_and_is_removed_from_url(public, monkeypatch, tmp_
     assert not at.text_input[0].disabled
     assert any("Presenter mode" in str(s.value) for s in at.success)
     assert "key" not in at.query_params
+
+
+def test_unwritable_key_file_means_no_presenter(public, monkeypatch, tmp_path):
+    monkeypatch.delenv("EGRESS_ADMIN_KEY", raising=False)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    monkeypatch.setattr(access, "KEY_FILE", ro / "sub" / "key")
+    try:
+        assert access.admin_key() == "" and not access.is_presenter("anything")
+    finally:
+        ro.chmod(0o700)
