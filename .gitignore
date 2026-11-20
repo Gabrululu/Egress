@@ -5,3 +5,4 @@ __pycache__/
 .env
 output/*
 !output/.gitkeep
+.cache/

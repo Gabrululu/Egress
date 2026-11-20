@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests + offline migration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Byte-compile
+        run: python -m compileall -q scanner copilot app.py ui_theme.py sample_app
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Generate migration offline (templates) and validate compose
+        run: python -m copilot sample_app --no-llm
+      - name: Security policy on generated compose
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from copilot.policy import check_compose_file
+          v = check_compose_file(Path("output/docker-compose.yml"))
+          assert not v, v
+          print("policy OK")
+          PY
+
+  e2e:
+    name: Deploy migrated stack + smoke test
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Generate + deploy (docker compose up --wait)
+        run: |
+          python -m copilot sample_app --no-llm
+          python -c "from copilot import deploy; from copilot.generator import DEFAULT_OUT; deploy.up(DEFAULT_OUT)"
+      - name: Smoke test (upload -> S3-compatible storage -> Postgres -> RabbitMQ -> worker)
+        run: |
+          echo "hello from CI" > /tmp/ci.txt
+          curl -fsS -F file=@/tmp/ci.txt http://localhost:5000/upload
+          for i in $(seq 1 20); do
+            curl -fsS http://localhost:5000/uploads | grep -q '"processed:' && { echo "processed ✔"; exit 0; }
+            sleep 1
+          done
+          echo "worker did not process the upload"; exit 1
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f output/docker-compose.yml logs --tail 80
+      - name: Tear down
+        if: always()
+        run: docker compose -f output/docker-compose.yml down -v || true
+
+  docker:
+    name: Build Egress image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t egress:ci .
+      - name: Scanner runs inside the image
+        run: docker run --rm egress:ci python -m scanner /opt/egress/sample_app --summary

@@ -1,0 +1,46 @@
+# Egress scanning its own repository: lock-in findings appear under Security > Code scanning.
+# (sample_app/ is intentionally locked-in, so its alerts are expected.)
+name: Egress lock-in scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      fail_above:
+        description: "Fail if the overall lock-in score is above this value (100 = never fail)"
+        default: "100"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The scanner only needs the standard library: no install step.
+      - name: Scan and export SARIF
+        run: >
+          python -m scanner .
+          --exclude-dir tests --exclude-dir output
+          --sarif egress.sarif --summary
+          --fail-above "${{ github.event.inputs.fail_above || '100' }}"
+      - name: Upload to GitHub Code Scanning
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: egress.sarif
+          category: egress-lock-in
+      - name: Keep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egress-sarif
+          path: egress.sarif

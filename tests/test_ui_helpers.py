@@ -52,8 +52,71 @@ def test_streamlit_scan_and_generate(monkeypatch, tmp_path):
     assert not at.exception
     at.button[0].click().run()  # Scan
     assert not at.exception and not at.error
-    assert any("Lock-in scan" in s.value for s in at.subheader)
+    assert any("Lock-in scan" in str(x.value) for x in at.markdown)
     gen_btn = next(b for b in at.button if "Generate" in b.label)
     gen_btn.click().run()
     assert not at.exception and not at.error
     assert any("Offline templates" in str(mt.value) for mt in at.metric)
+
+
+def test_provider_name():
+    import ui_theme as ui
+    assert ui.provider_name("https://api.mistral.ai/v1") == "Mistral"
+    assert ui.provider_name("https://api.openai.com/v1") == "OpenAI"
+    assert ui.provider_name("http://localhost:11434/v1") == "Ollama"
+    assert ui.provider_name("https://llm.example.eu/v1") == "Custom endpoint"
+
+
+# ---------------------------------------------------------------- background deploy
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+from copilot import deploy  # noqa: E402
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_port_conflict_detected(tmp_path):
+    port = _free_port()
+    (tmp_path / "docker-compose.yml").write_text(
+        f"name: egress-test-ports\nservices:\n  db:\n    image: postgres:16-alpine\n    ports: ['{port}:5432']\n")
+    with socket.socket() as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen()
+        conflicts = deploy.port_conflicts(tmp_path)
+    assert any(str(port) in c for c in conflicts), conflicts
+
+
+def test_start_up_blocked_by_policy(tmp_path):
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  x:\n    image: postgres:16-alpine\n    privileged: true\n")
+    with pytest.raises(deploy.DeployError, match="security policy"):
+        deploy.start_up(tmp_path)
+    assert deploy.current_job(tmp_path) is None
+
+
+def test_background_job_lifecycle(tmp_path, monkeypatch):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  x:\n    image: postgres:16-alpine\n")
+    script = "import time; print('building...', flush=True); time.sleep(1); print('done')"
+
+    def fake_spawn(args, cwd, log_path):
+        assert args[:2] == ["docker", "compose"] and "--wait" in args
+        log = open(log_path, "w")
+        return subprocess.Popen([sys.executable, "-c", script], stdout=log, stderr=subprocess.STDOUT)
+    monkeypatch.setattr(deploy, "_spawn", fake_spawn)
+
+    job = deploy.start_up(tmp_path)
+    assert job.running
+    with pytest.raises(deploy.DeployError, match="already running"):
+        deploy.start_up(tmp_path)
+    job.proc.wait(timeout=10)
+    assert not job.running and job.returncode == 0
+    assert "done" in job.tail()
+    deploy.clear_job(tmp_path)
+    assert deploy.current_job(tmp_path) is None

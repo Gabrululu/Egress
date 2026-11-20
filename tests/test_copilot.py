@@ -13,6 +13,12 @@ NO_KEY = LLMConfig(api_key="", base_url="https://api.example.com/v1")
 KEY = LLMConfig(api_key="test-key", base_url="https://api.example.com/v1", model="m")
 
 
+@pytest.fixture(autouse=True)
+def isolated_cache(tmp_path_factory, monkeypatch):
+    """Never read/write the real repo cache from tests."""
+    monkeypatch.setattr(gen, "CACHE_DIR", tmp_path_factory.mktemp("llm-cache"))
+
+
 def _llm_reply(compose=None):
     return {
         "mapping": [{"aws": "S3", "alternative": "SeaweedFS", "reason": "S3 API"}],
@@ -77,3 +83,107 @@ def test_regenerate_keeps_gitkeep(tmp_path):
     gen.generate(SAMPLE, out_dir=tmp_path, cfg=NO_KEY)
     gen.generate(SAMPLE, out_dir=tmp_path, cfg=NO_KEY)
     assert (tmp_path / ".gitkeep").exists()
+
+
+def test_chat_json_retries_without_temperature(monkeypatch):
+    """Reasoning models (GPT-5 / o-series) reject temperature: client retries without it."""
+    import httpx
+    import openai
+
+    from copilot.llm import chat_json
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kw):
+            calls.append(kw)
+            if "temperature" in kw:
+                raise openai.BadRequestError(
+                    "temperature not supported",
+                    response=httpx.Response(400, request=httpx.Request("POST", "http://x")), body=None)
+            msg = type("M", (), {"content": '{"ok": true}'})
+            return type("R", (), {"choices": [type("C", (), {"message": msg})]})
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})
+
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    assert chat_json("s", "u", KEY) == {"ok": True}
+    assert len(calls) == 2 and "temperature" not in calls[1] and "response_format" in calls[1]
+
+
+EVIL = fallback.compose_text().replace(
+    "    restart: unless-stopped\n\n  worker:",
+    "    restart: unless-stopped\n    privileged: true\n    volumes:\n"
+    "      - /var/run/docker.sock:/var/run/docker.sock\n\n  worker:", 1)
+
+
+def test_llm_compose_blocked_by_security_policy(tmp_path, monkeypatch):
+    assert "privileged: true" in EVIL
+    monkeypatch.setattr(gen, "chat_json", lambda *a, **k: _llm_reply(EVIL))
+    r = gen.generate(SAMPLE, out_dir=tmp_path, cfg=KEY)
+    assert r["sources"]["compose"] == "fallback"
+    assert any("security policy" in e for e in r["errors"])
+    assert "privileged" not in (tmp_path / "docker-compose.yml").read_text()
+    assert r["llm"]["repair"] == "failed"
+
+
+def test_repair_loop_fixes_compose(tmp_path, monkeypatch):
+    calls = []
+
+    def fake(system, user, cfg, history=None):
+        calls.append(history)
+        return _llm_reply("services: [oops") if history is None else _llm_reply()
+    monkeypatch.setattr(gen, "chat_json", fake)
+    r = gen.generate(SAMPLE, out_dir=tmp_path, cfg=KEY)
+    assert r["path"] == "llm" and r["llm"]["repair"] == "fixed" and r["llm"]["calls"] == 2
+    assert "rejected by automated checks" in calls[1][-1]["content"]
+    assert calls[1][0]["role"] == "assistant"
+
+
+def test_cache_hit_skips_llm(tmp_path, monkeypatch):
+    n = {"calls": 0}
+
+    def fake(*a, **k):
+        n["calls"] += 1
+        return _llm_reply()
+    monkeypatch.setattr(gen, "chat_json", fake)
+    cache = tmp_path / "cache"
+    r1 = gen.generate(SAMPLE, out_dir=tmp_path / "o1", cfg=KEY, cache_dir=cache)
+    r2 = gen.generate(SAMPLE, out_dir=tmp_path / "o2", cfg=KEY, cache_dir=cache)
+    assert n["calls"] == 1
+    assert r1["llm"]["cache"] == "miss" and r2["llm"]["cache"] == "hit" and r2["path"] == "llm"
+    r3 = gen.generate(SAMPLE, out_dir=tmp_path / "o3", cfg=KEY, cache_dir=cache, use_cache=False)
+    assert n["calls"] == 2 and r3["llm"]["cache"] == "off"
+
+
+def test_invalid_results_not_cached(tmp_path, monkeypatch):
+    monkeypatch.setattr(gen, "chat_json", lambda *a, **k: _llm_reply("services: [oops"))
+    cache = tmp_path / "cache"
+    gen.generate(SAMPLE, out_dir=tmp_path / "o", cfg=KEY, cache_dir=cache)
+    assert not cache.exists() or not list(cache.iterdir())
+
+
+def test_chat_json_prefers_strict_schema(monkeypatch):
+    import openai
+
+    from copilot.llm import chat_json
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kw):
+            calls.append(kw)
+            msg = type("M", (), {"content": '{"ok": 1}'})
+            return type("R", (), {"choices": [type("C", (), {"message": msg})]})
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})
+
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    chat_json("s", "u", KEY, history=[{"role": "user", "content": "fix"}])
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[0]["response_format"]["json_schema"]["strict"] is True
+    assert calls[0]["messages"][-1]["content"] == "fix"

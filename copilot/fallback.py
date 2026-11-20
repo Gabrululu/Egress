@@ -42,11 +42,13 @@ RISKS = {
     "boto3": "Low: library stays, only configuration changes.",
 }
 
-# (template file, target-repo file to diff against)
+# (template file, target-repo file it replaces). Original == new name -> modify; different
+# names -> rename (lambda_function.py becomes worker.py); missing original -> new file.
 DIFF_PAIRS = [
     ("app/app.py", "app.py"),
     ("app/worker.py", "lambda_function.py"),
     ("app/requirements.txt", "requirements.txt"),
+    ("app/Dockerfile", "Dockerfile"),
     ("docker-compose.yml", "docker-compose.yml"),
 ]
 
@@ -61,17 +63,36 @@ def compose_text() -> str:
     return (TEMPLATES / "docker-compose.yml").read_text(encoding="utf-8")
 
 
+def _git_diff(old_name: str | None, new_name: str, old: list[str], new: list[str]) -> str:
+    """Unified diff with git headers so `git apply` handles renames and new files."""
+    if old_name is None:
+        header = f"diff --git a/{new_name} b/{new_name}\nnew file mode 100644\n"
+        body = difflib.unified_diff([], new, fromfile="/dev/null", tofile=f"b/{new_name}")
+    else:
+        header = f"diff --git a/{old_name} b/{new_name}\n"
+        if old_name != new_name:
+            header += f"rename from {old_name}\nrename to {new_name}\n"
+        body = difflib.unified_diff(old, new, fromfile=f"a/{old_name}", tofile=f"b/{new_name}")
+    body = "".join(body)
+    if not body:
+        return ""
+    if not body.endswith("\n"):
+        body += "\n\\ No newline at end of file\n"
+    return header + body
+
+
 def diffs(target: Path) -> list[dict]:
     base = target if target.is_dir() else target.parent
     out = []
     for tmpl, orig_name in DIFF_PAIRS:
         new = (TEMPLATES / tmpl).read_text(encoding="utf-8").splitlines(keepends=True)
-        orig_path = base / orig_name
-        old = orig_path.read_text(encoding="utf-8").splitlines(keepends=True) if orig_path.is_file() else []
         new_name = Path(tmpl).name if tmpl.startswith("app/") else tmpl
-        d = "".join(difflib.unified_diff(old, new,
-                                         fromfile=f"a/{orig_name}" if old else "/dev/null",
-                                         tofile=f"b/{new_name}"))
+        orig_path = base / orig_name
+        if orig_path.is_file():
+            old = orig_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            d = _git_diff(orig_name, new_name, old, new)
+        else:
+            d = _git_diff(None, new_name, [], new)
         if d:
             out.append({"file": new_name, "diff": d})
     return out

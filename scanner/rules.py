@@ -119,7 +119,7 @@ RULES: list[Rule] = [
     # ---------------- IAM
     _r("tf-iam", "IAM", [TF], r'resource\s+"aws_iam_\w+"', "medium",
        "IAM roles/policies: AWS-specific identity and authorization model."),
-    _r("any-iam-arn", "IAM", ANY, r"arn:aws:iam::", "medium",
+    _r("any-iam-arn", "IAM", ANY, r"arn:aws:iam::", "medium",  # egress: ignore (pattern itself)
        "References AWS IAM ARNs."),
     _r("any-aws-keys", "IAM", [COMPOSE, PY], r"\bAWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)\b", "low",
        "AWS credential chain."),

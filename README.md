@@ -14,7 +14,8 @@ EU data-sovereignty requirements make this an urgent question.
 ## Solution
 
 1. **Scan**: rule-based detection over Terraform, docker-compose, Python and
-   `requirements.txt`. Every finding has file, line, evidence, reason and severity.
+   `requirements.txt`; Python is also parsed with `ast` (multi-line calls, import aliases,
+   `boto3.Session().client(...)`, `service_name=`). Every finding has file, line, evidence, reason and severity.
 2. **Score**: 0-100 per service and overall, weighted by proprietary API (50%),
    data format (30%) and egress cost (20%).
 3. **Migrate**: an OpenAI-compatible LLM (Mistral, OpenAI, Ollama, vLLM...) produces
@@ -78,6 +79,33 @@ cp .env.example .env    # optional: add LLM_API_KEY for the LLM path
 make run                # Streamlit on http://localhost:8501
 ```
 
+### Option B: run Egress itself in Docker (host needs only Docker)
+
+```bash
+make docker-build       # pinned base images, ~2 min, ~1.3 GB
+make docker-run         # UI on http://localhost:8501 (passes .env if present)
+```
+
+`docker-run` uses host networking, mounts the Docker socket (so Egress can deploy the stack;
+this grants control of the host's Docker, local use only) and mounts `output/` **at the same
+path** (`EGRESS_OUTPUT_DIR`) because compose bind mounts are resolved by the host daemon.
+Files are written with your uid/gid.
+
+Dependencies and container images are pinned (exact versions in `requirements.txt`,
+`@sha256` digests in the Dockerfiles and the generated compose).
+
+### CI and GitHub Code Scanning
+
+- `.github/workflows/ci.yml`: unit tests, offline migration + compose/policy validation, a real
+  `docker compose up` of the migrated stack with an upload smoke test, and the Egress image build.
+- `.github/workflows/egress-scan.yml`: Egress scans its own repo and uploads **SARIF** to
+  *Security → Code scanning* (`sample_app/` alerts are expected: it is the locked-in demo).
+
+```bash
+python -m scanner . --sarif egress.sarif --exclude-dir tests --fail-above 70   # CI gate
+```
+Suppress a single line with a comment containing `egress: ignore` (like `# noqa`).
+
 Other targets: `make test` (pytest), `make scan` (CLI scan of `sample_app`),
 `make clean` (removes .venv, caches and generated output).
 Different interpreter: `make install PYTHON=python3.12`.
@@ -113,9 +141,16 @@ cd output && docker compose up -d --build --wait        # run migrated stack
 | 1:05 | Show badge (LLM / Offline / Mixed), then tabs *Mapping → Code diffs → Plan* | "Every part is validated. If the LLM fails, built-in templates take over, so the demo never breaks. The diff is tiny: `endpoint_url`, pika instead of SQS, Lambda → worker." |
 | 1:25 | Click **🚀 Deploy** | "`docker compose up`: Postgres, S3-compatible storage, RabbitMQ, API and worker, all open-source." |
 | 1:45 | Click **🧪 Smoke test upload** | "Upload → object storage → Postgres → queue → worker marks it processed. Same app, zero AWS." |
+| 1:50 | Click **⬇ Migration (.zip)** | "Everything is portable: compose, code, diffs, plan and a report. Secrets never leave." |
 | 1:55 | Click **⏹ Stop** | "Egress: from lock-in to running locally in two minutes." |
 
-Tip: deploy once before presenting so images are cached (first build ≈ 1-2 min).
+**Before presenting:**
+
+```bash
+make demo-warm     # pre-pull pinned images + pre-build the app image (offline-safe Deploy)
+make demo-check    # READY / NOT READY: Docker, compose, disk, images, ports, stack, UI, LLM, cache
+make demo-reset CONFIRM=yes   # optional clean slate: stops the stack, wipes volumes + output/
+```
 Toggle **Force offline templates** in the sidebar if the network is unreliable.
 
 ## Fallback behavior
@@ -128,17 +163,51 @@ Everything that depends on the network or the LLM has an offline path:
 | Timeout / API / network error | Error recorded → templates (`fallback`) |
 | Reply is not valid JSON | Templates (`fallback`) |
 | A single part invalid (e.g. bad diffs) | Only that part from templates (`path: mixed`) |
-| LLM compose fails `docker compose config` | Saved as `docker-compose.llm.yml` for inspection; template compose used |
-| LLM compose breaks the contract (service names, env vars, AWS references) | Template compose used |
+| LLM compose fails `docker compose config`, the contract or the security policy | **One repair round**: the error is sent back to the LLM; if the fix still fails, the template compose is used (candidate kept as `docker-compose.llm.yml`) |
+| Same scan + model + prompt as a previous successful run | Answer served from the local cache `.cache/llm/` (instant, offline, free) |
 | Docker not installed | Compose validated as YAML only; deploy shows an error |
 | git clone fails / times out (90s) | Clear error in the UI, no stack trace |
 
 The UI shows the path used (🤖 LLM / 📦 Offline templates / 🤖+📦 mixed), the
 source of each part and the reason for each fallback. `output/result.json` records the same.
 
-Note: the runnable code in `output/app/` always comes from the templates (written for
-`sample_app`). For other repos the mapping, diffs and plan are tailored, but the runnable
-stack is the reference implementation.
+### Security policy for generated compose files
+
+The Deploy button runs whatever the generator produced, and the LLM prompt contains code
+from the scanned repo (prompt-injection risk). `copilot/policy.py` therefore rejects, both at
+generation time and right before deploy:
+
+- images outside an allowlist (postgres, seaweedfs, rabbitmq, garage, minio, redis, ...)
+- `privileged`, `cap_add`, `devices`, `pid`/`ipc`/`network_mode: host`, `security_opt`, `sysctls`
+- any reference to `docker.sock`, bind mounts or build contexts outside `output/`
+- host ports outside the demo set (5000, 5432, 9000, 9001, 5672, 15672)
+
+Deploys run in the background (`output/.deploy.log`, live in the UI); busy host ports are
+reported before starting.
+
+### Data migration scripts
+
+Generated in `output/data-migration/` for the detected services, with defaults inferred from
+your Terraform (bucket, queue, DB name/user, region). All are **dry runs unless confirmed** and
+run their tools in pinned containers (only Docker needed):
+
+| Script | Moves | How | Verifies |
+|---|---|---|---|
+| `01_postgres.sh` | RDS → PostgreSQL | `pg_dump \| pg_restore --clean` | row counts per table |
+| `02_s3.sh` | S3 → SeaweedFS | `rclone sync --checksum` | `rclone check --one-way` |
+| `03_sqs_to_rabbitmq.py` | SQS → RabbitMQ | drain with publisher confirms, delete only after confirm | stats |
+| `04_dynamodb.md` | DynamoDB | guide (data-model change) | - |
+
+The UI also draws **before/after architecture diagrams** from the scan (Graphviz, no extra deps).
+
+### Runnable app built from your repo
+
+After generating, Egress copies the scanned repo, applies every app-level diff with
+`git apply --check` + `git apply` (git-style patches, so `lambda_function.py → worker.py` is a
+real rename), retires AWS-only infrastructure (`*.tf`, the old compose) and verifies the result
+(required `Dockerfile`/`app.py`/`worker.py`, every `.py` compiles, Dockerfile `FROM python`).
+If everything passes, `output/app/` **is your patched code**; otherwise the reference template
+is used and the UI lists which patch failed and why.
 
 ## Lock-in scoring formula
 
@@ -158,6 +227,11 @@ service_score = round(base * depth)           # 0-100
 overall       = round(0.5*max(service_scores) + 0.5*mean(service_scores))
 rating        = high (>=70) | medium (>=40) | low
 ```
+
+**Mitigations.** In a Python file that configures a non-AWS `endpoint_url`, boto3/S3 findings
+are kept (flagged `mitigated`) but not scored: the client speaks the portable S3 API
+(SeaweedFS, Garage, MinIO...). After generating, Egress re-scans the migrated stack and shows
+**Before → After** (sample app: 63 → 0).
 
 `depth` rewards evidence: a single low-severity hint scores far less than a
 Terraform resource plus SDK calls. The overall score blends the worst service with the
@@ -180,10 +254,15 @@ tests/        pytest: scanner rules/scoring, copilot paths, UI helpers + Streaml
 
 ## Security notes
 
-No secrets in the repo: only `.env.example`; `.env` and `output/` are gitignored. The
-generated stack uses **demo-only credentials** (override `DB_PASSWORD` / `RABBITMQ_PASSWORD`
-via env). Scanned code is sent to the configured LLM endpoint; use a self-hosted model
-(Ollama) for sensitive repos.
+- No secrets in the repo: only `.env.example`; `.env`, `output/` and `.cache/` are gitignored.
+- **Generated credentials**: each migration writes `output/.env` (chmod 600) with random
+  `DB_PASSWORD`, `RABBITMQ_PASSWORD`, `S3_SECRET_KEY`, reused on regeneration so existing data
+  volumes keep working. *Stop → Wipe data & rotate credentials* deletes volumes and rotates them.
+- **What reaches the LLM**: the UI's *What will be sent to the LLM* panel shows the exact prompt,
+  lets you exclude files, estimates tokens, and masks likely secrets (AWS keys, passwords,
+  tokens, private keys) before sending. Offline mode sends nothing; use Ollama for sensitive repos.
+- Generated compose files pass a security policy before deploy (see above).
+- In GitHub Codespaces, service links use the forwarded `*.app.github.dev` URLs automatically.
 
 ## License
 
