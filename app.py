@@ -243,7 +243,7 @@ if report:
             msg = "🔐 Credentials live in `output/.env` (gitignored, chmod 600)"
             msg += f": generated {', '.join(sec['created'])}" if sec.get("created") else ": reused existing values"
             st.caption(msg + ".")
-            if sec.get("legacy_db_password"):
+            if sec.get("legacy_db_password") and PRESENTER:
                 st.warning("An existing Postgres volume was found, so the old demo DB password is kept to stay "
                            "compatible. Use **Stop** with *Wipe data & rotate credentials* to switch to random ones.")
         for e in m["errors"]:
@@ -281,6 +281,11 @@ if report:
                            help="compose, app, diffs, plan and REPORT.md. Secrets (.env) are never included.")
         d2.download_button("⬇ Report (.md)", data=report_md, file_name="egress-report.md",
                            mime="text/markdown", width="stretch", on_click="ignore")
+
+else:  # keep the 01 → 02 → 03 story visible before the first scan
+    md(ui.section("02 · Migrate", "Generate the exit plan.",
+                  "Mapping, new docker-compose, code diffs and a plan, from the LLM with validated template fallback."))
+    st.caption("⬆ Run a scan first: the migration is generated from its findings.")
 
 # ------------------------------------------------------------------ 3. deploy
 def show_job(job):
