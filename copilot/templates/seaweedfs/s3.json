@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "egress",
+      "credentials": [{"accessKey": "egress", "secretKey": "egress-demo-secret"}],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
